@@ -40,8 +40,8 @@ and therefore the release, anchored to a stale commit.
 Its body is generated each push from [`RELEASE.dev.md`](../../RELEASE.dev.md)
 (the rolling-build notice, plus a `## New Features and Key Changes` section
 the workflow fills in with every PR merged into `develop` that isn't in
-`main` yet), before `.github/scripts/gen_upgrade_desc.js` reads that
-section into the `upgrade_desc.json` asset described below.
+`main` yet), before `.github/scripts/append_checksums.js` appends the
+`## Checksums` section `upgrade_desc.js` reads from, described below.
 
 `?build_profile=` (`extended` or `extended-afc`, defaulting to `extended`)
 picks which release asset to offer — `findAsset()` in
@@ -64,7 +64,7 @@ which is unrelated to this flow):
   "data": {
     "id": 342972029,
     "name": "v1.4.1-paxx12-20",
-    "note": "https://github.com/.../U1_extended_1.4.1-paxx12-20_upgrade_desc.json",
+    "note": "https://snapmakeru1-extended-firmware.pages.dev/api/device/firmware/upgrade_desc?id=342972029&asset_id=298541203",
     "url": "https://github.com/.../U1_extended_1.4.1-paxx12-20_upgrade.bin",
     "status": 200,
     "version": "1.4.1-paxx12-20",
@@ -77,26 +77,28 @@ which is unrelated to this flow):
 When the device is already on this build, `data` is `null` instead (see
 above) — no `note`/`url` to follow.
 
-`note` and `url` both point straight at GitHub release assets rather than
-anything on this host — `findAsset()` in `_lib/github-releases.js` matches
-`url` on the `U1_extended_`/`U1_extended-afc_` filename prefix CI gives each
-profile plus the shared `_upgrade.bin` suffix, and `note` the same prefix
-plus `_upgrade_desc.json`. `unisrv` fetches both with its own `curl` handle
-(not intercepted by the shim), so it still attaches its Snapmaker
-`Authorization: Bearer` header — modern libcurl (device ships 8.6.0) strips
-that header by default on any cross-host redirect, so it never reaches
-GitHub.
+`url` points straight at the `.bin` GitHub release asset — `findAsset()` in
+`_lib/github-releases.js` matches it on the `U1_extended_`/`U1_extended-afc_`
+filename prefix CI gives each profile plus the `_upgrade.bin` suffix. `note`
+points back at this same host's `GET /api/device/firmware/upgrade_desc`
+(below), carrying `?id=`/`?asset_id=` (`release.id`/`binAsset.id` — not
+`channel`/`build_profile` again) so it's pinned to the exact release and
+asset just resolved here, rather than re-running channel resolution and
+risking it land on something else if a new release publishes in between.
+`unisrv` fetches both with its own `curl` handle (not intercepted by the
+shim), so it still attaches its Snapmaker `Authorization: Bearer` header;
+we just ignore it.
 
 On failure, the status mirrors whatever GitHub returned (e.g. `403` on
 rate-limit), falling back to `502` for network errors.
 
-## The `upgrade_desc` asset
+## `GET /api/device/firmware/upgrade_desc`
 
-The `note` URL above. Each CI workflow that publishes a release
-(`.github/workflows/develop.yaml`, `pre_release.yaml`) runs
-`.github/scripts/gen_upgrade_desc.js` against the `.bin` it just built
-and uploads the result as a release asset alongside it, named the same
-as the `.bin` but ending `_upgrade_desc.json` instead of `_upgrade.bin`:
+The `note` URL above. Takes `?id=`/`?asset_id=` (the release and asset ids
+`latest.js` already resolved) and looks both up directly by id via
+`getReleaseById()`, then builds the descriptor `unisrv` downloads on
+demand — dynamically, from that release's live state, rather than a static
+asset baked in at build time:
 
 ```json
 {
@@ -110,31 +112,49 @@ as the `.bin` but ending `_upgrade_desc.json` instead of `_upgrade.bin`:
 }
 ```
 
-`md5`/`sha256`/`size` are computed straight from the built `.bin`, once, in
-CI — `unisrv` verifies the downloaded firmware's MD5 against this field and
-fails the update on a mismatch, so unlike the dummy value this endpoint
-used to serve, it must be real. `release_notes.en-GB` is scraped from that
-workflow's own release-notes file (`RELEASE.dev.md` for `develop`,
-`RELEASE.md` for `stable`/`testing`) at build time, via the same
-`## New Features and Key Changes` bullet-list parsing `extractSection()`
-used to do in `_lib/github-releases.js`. This means it's frozen at whatever
-that file said when CI ran: `develop`'s notes are always fully
-CI-generated already, so this is a non-issue there, but `stable`/`testing`
-release notes are normally hand-edited in the GitHub UI on the draft
-release *after* `pre_release.yaml` runs — those edits are **not** reflected
-in `upgrade_desc.json`, which keeps whatever `RELEASE.md` said at build time
-(usually the literal `- TBD` placeholder) unless something re-generates and
-re-uploads the asset afterwards.
+`unisrv` verifies the downloaded firmware's MD5 against `md5`, failing the
+update on a mismatch, so it must be real — but hashing the ~300MB `.bin` on
+every device request would be far too slow. Instead, each CI workflow that
+publishes a release (`.github/workflows/develop.yaml`, `pre_release.yaml`)
+hashes it once, at build time, and has `.github/scripts/append_checksums.js`
+append the result as a bullet in a `## Checksums` section of that workflow's
+release-notes file (`RELEASE.dev.md` for `develop`, `RELEASE.md` for
+`stable`/`testing`) — one bullet per built asset, keyed by its exact
+filename:
+
+```markdown
+## Checksums
+
+- U1_extended_1.4.1-paxx12-20_upgrade.bin: md5=8f14e45fceea167a5a36dedd4bea2543 sha256=8ddb1d6dc889f8c11d6ac708dd4858439b13e830d3bf93064e857433a70ff3c3 size=290327624
+```
+
+`extractChecksums()` in `_lib/github-releases.js` reads that bullet back out
+of `release.body` at request time. `release_notes.en-GB`, by contrast, is
+scraped straight from the *live* `## New Features and Key Changes` section
+of `release.body` on every request, via `extractSection()` — so unlike the
+static `upgrade_desc.json` release asset this replaced, hand-editing release
+notes in the GitHub UI after publishing (normal for `stable`/`testing`,
+which start out as a draft with `- TBD` placeholder notes) is reflected
+immediately, with nothing needing to re-run or re-sync anything.
 
 ## Caching & config
 
-`latest.js` caches every response at Cloudflare's edge (Cache API), success
-or error alike, keyed on the full request URL (so per `channel`).
-Successful responses use `CACHE_SECONDS` (5 min); errors — bad input, no
-matching release, GitHub rate-limited or unreachable — use the shorter
-`NEGATIVE_CACHE_SECONDS` (1 min, both in `_lib/github-releases.js`), so a
-burst of devices hitting a broken or rate-limited state only causes one
-GitHub API call per TTL instead of one per request.
+Two independent cache layers, both on Cloudflare's edge Cache API:
+
+- Each endpoint caches its own full JSON response keyed on the incoming
+  request URL (so per `channel`/`build_profile`/etc — see `cached()` in
+  `_lib/github-releases.js`), success or error alike. Successful responses
+  use `CACHE_SECONDS` (5 min); errors — bad input, no matching release,
+  GitHub rate-limited or unreachable — use the shorter
+  `NEGATIVE_CACHE_SECONDS` (1 min), so a burst of devices hitting a broken
+  or rate-limited state only causes one GitHub API resolution per TTL
+  instead of one per request.
+- `githubApi()` in `_lib/github-releases.js` separately caches each raw
+  GitHub API call it makes, keyed on the GitHub API path alone (`CACHE_SECONDS`,
+  successful responses only). This is what lets `latest.js` and
+  `upgrade_desc.js` — two separate device requests that both resolve the
+  same release — share one upstream GitHub API call instead of doubling it,
+  even though their outer response caches (above) are keyed differently.
 
 | Env var        | Required | Purpose                                                                    |
 |----------------|----------|-------------------------------------------------------------------------------|
