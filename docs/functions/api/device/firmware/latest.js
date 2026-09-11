@@ -3,35 +3,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 @paxx12
 // 
 import {
-  CACHE_SECONDS,
-  NEGATIVE_CACHE_SECONDS,
+  cached,
   findAsset,
   findRelease,
+  jsonResponse,
 } from "../../../_lib/github-releases.js";
 
 const CHANNELS = ["stable", "testing", "develop"];
 const BIN_ASSET_PREFIX = "U1_";
 const BIN_ASSET_SUFFIX = "_upgrade.bin";
-const DESC_ASSET_SUFFIX = "_upgrade_desc.json";
-
-function jsonResponse(body, status = 200) {
-  const maxAge = status < 400 ? CACHE_SECONDS : NEGATIVE_CACHE_SECONDS;
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${maxAge}`,
-    },
-  });
-}
-
-// Caches every response — success or error alike — so a burst of identical
-// requests (e.g. many printers on the same channel) only hits the GitHub API
-// once per TTL, whichever TTL `jsonResponse()` picked for that status.
-function cached(cache, waitUntil, request, response) {
-  waitUntil(cache.put(request, response.clone()));
-  return response;
-}
 
 // Trims the fractional-seconds/`Z` suffix GitHub timestamps carry, to match
 // the plain `YYYY-MM-DDTHH:MM:SS` shape of Snapmaker's own API responses.
@@ -75,19 +55,19 @@ export async function onRequestGet(context) {
     ));
   }
 
-  // Built by `.github/scripts/gen_upgrade_desc.js` and uploaded as a release asset
-  // alongside the `.bin` it describes — see that script for why (mainly:
-  // real `md5`, computed once at build time instead of never).
-  const descAsset = findAsset(release, `${BIN_ASSET_PREFIX}${buildProfile}_`, DESC_ASSET_SUFFIX);
-
-  if (!descAsset) {
-    return cached(cache, waitUntil, request, jsonResponse(
-      { code: 404, msg: `release '${release.tag_name}' has no '${buildProfile}' upgrade descriptor`, data: null },
-      404,
-    ));
-  }
-
   let newVersion = (release.name || release.tag_name).replace(/^(?:Rolling:\s*)?v/, "");
+
+  // `upgrade_desc.js` builds this descriptor dynamically from the same
+  // release, rather than us pointing at a static `_upgrade_desc.json`
+  // release asset — see that endpoint for why. Pinned to the exact
+  // `release`/`binAsset` we just resolved (by id, not `channel`/
+  // `build_profile` again) so it can't drift onto a different release if
+  // a new one gets published between this request and the device following
+  // `note` — a plain re-run of channel resolution could otherwise pick
+  // something newer for `testing`/`stable`.
+  const noteUrl = new URL("/api/device/firmware/upgrade_desc", url.origin);
+  noteUrl.searchParams.set("id", release.id);
+  noteUrl.searchParams.set("asset_id", binAsset.id);
 
   const body = {
     code: 200,
@@ -95,7 +75,7 @@ export async function onRequestGet(context) {
     data: {
       id: release.id,
       name: release.name || release.tag_name,
-      note: descAsset.browser_download_url,
+      note: noteUrl.toString(),
       url: binAsset.browser_download_url,
       status: 200,
       version: newVersion,
