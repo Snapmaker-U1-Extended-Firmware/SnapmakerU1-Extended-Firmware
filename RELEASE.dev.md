@@ -9,3 +9,7 @@
 ## New Features and Key Changes
 
 <!-- CHANGELOG_PLACEHOLDER -->
+
+## Checksums
+
+<!-- CHECKSUMS_PLACEHOLDER -->
