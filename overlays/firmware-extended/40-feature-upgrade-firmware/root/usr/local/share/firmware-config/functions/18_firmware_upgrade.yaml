@@ -141,7 +141,7 @@ quick_actions:
                     os.remove(tmp_file)
                 except FileNotFoundError:
                     pass
-                if subprocess.run(["curl", "-L", "-f", "-sS", bin_url, "-o", tmp_file]).returncode != 0:
+                if subprocess.run(["curl", "-L", "-f", "--progress-bar", bin_url, "-o", tmp_file]).returncode != 0:
                     print("ERROR: Failed to download firmware upgrade file.")
                     os.remove(tmp_file)
                     return 1
